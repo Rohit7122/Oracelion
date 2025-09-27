@@ -5,6 +5,7 @@ import torchaudio
 import argparse
 import uuid
 import os
+import subprocess
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Any, TypedDict
@@ -55,6 +56,90 @@ class AudioTranscriptionPipeline:
         self.workflow = self._build_workflow()
         self.memory = MemorySaver()
         self.app = self.workflow.compile(checkpointer=self.memory)
+    
+    def _convert_to_wav(self, input_path: str, output_dir: Path) -> str:
+        """
+        Convert audio file to WAV format using ffmpeg (cross-platform)
+        
+        Args:
+            input_path: Path to input audio file
+            output_dir: Directory to save converted file
+            
+        Returns:
+            str: Path to converted WAV file
+        """
+        import platform
+        
+        input_path_obj = Path(input_path)
+        wav_filename = f"converted_{input_path_obj.stem}.wav"
+        wav_path = output_dir / wav_filename
+        
+        try:
+            # Try different ffmpeg executable names based on platform
+            ffmpeg_cmd = 'ffmpeg'
+            if platform.system() == 'Windows':
+                # On Windows, try common ffmpeg locations
+                ffmpeg_options = ['ffmpeg', 'ffmpeg.exe']
+                ffmpeg_cmd = None
+                
+                for cmd in ffmpeg_options:
+                    try:
+                        subprocess.run([cmd, '-version'], capture_output=True, check=True)
+                        ffmpeg_cmd = cmd
+                        break
+                    except (subprocess.CalledProcessError, FileNotFoundError):
+                        continue
+                
+                if ffmpeg_cmd is None:
+                    raise FileNotFoundError("ffmpeg not found")
+            
+            # Use ffmpeg to convert to WAV
+            cmd = [
+                ffmpeg_cmd, '-i', str(input_path),
+                '-ar', '16000',  # 16kHz sample rate (standard for speech)
+                '-ac', '1',      # Mono channel
+                '-y',            # Overwrite output file
+                str(wav_path)
+            ]
+            
+            print(f"🔄 Converting {input_path_obj.suffix} to WAV format...")
+            
+            # On Windows, use shell=True for better compatibility
+            shell_mode = platform.system() == 'Windows'
+            result = subprocess.run(cmd, capture_output=True, text=True, shell=shell_mode)
+            
+            if result.returncode != 0:
+                raise Exception(f"ffmpeg conversion failed: {result.stderr}")
+            
+            print(f"✅ Audio converted to: {wav_path}")
+            return str(wav_path)
+            
+        except FileNotFoundError:
+            system = platform.system()
+            if system == 'Windows':
+                install_msg = """
+ffmpeg not found. Please install ffmpeg for Windows:
+
+Option 1 - Using Chocolatey (Recommended):
+  1. Install Chocolatey: https://chocolatey.org/install
+  2. Run: choco install ffmpeg
+
+Option 2 - Manual Installation:
+  1. Download from: https://ffmpeg.org/download.html#build-windows
+  2. Extract to C:\\ffmpeg\\
+  3. Add C:\\ffmpeg\\bin to your PATH environment variable
+
+Option 3 - Using winget:
+  winget install ffmpeg
+                """
+            else:
+                install_msg = "ffmpeg not found. Please install ffmpeg to convert audio files."
+            
+            raise Exception(install_msg)
+        except Exception as e:
+            print(f"❌ Error converting audio: {e}")
+            # If conversion fails, try to use original file
+            return input_path
     
     def _create_session_directory(self, audio_file_path: str) -> tuple[str, str]:
         """
@@ -179,6 +264,11 @@ class AudioTranscriptionPipeline:
         
         output_dir = Path(state["output_dir"])
         
+        # Convert audio to WAV format if needed
+        audio_path = state["audio_file_path"]
+        if not audio_path.lower().endswith('.wav'):
+            audio_path = self._convert_to_wav(audio_path, output_dir)
+        
         # Initialize pipeline
         pipeline = Pipeline.from_pretrained(
             "pyannote/speaker-diarization-3.1",
@@ -192,10 +282,10 @@ class AudioTranscriptionPipeline:
         
         # Load models and audio
         asr_model = whisper.load_model(state["whisper_model_size"], device="cpu")
-        waveform, sr = torchaudio.load(state["audio_file_path"])
-        diarization = pipeline(state["audio_file_path"])
+        waveform, sr = torchaudio.load(audio_path)
+        diarization = pipeline(audio_path)
         
-        # MODIFIED PART: Group consecutive segments by speaker
+        # Group consecutive segments by speaker
         speaker_map = {}
         speaker_counter = 1
         transcript_segments = []
@@ -235,7 +325,7 @@ class AudioTranscriptionPipeline:
             if current_speaker is not None:
                 merged_segments.append((current_start, current_end, current_speaker))
             
-            # Process merged segments
+            # Process merged segments individually (fixed batching issue)
             for start_time, end_time, speaker in merged_segments:
                 # Map speakers
                 if speaker not in speaker_map:
@@ -244,32 +334,51 @@ class AudioTranscriptionPipeline:
                 
                 speaker_label = speaker_map[speaker]
                 
-                # Process audio segment
+                # Process audio segment individually
                 start_frame = int(start_time * sr)
                 end_frame = int(end_time * sr)
+                
+                # Ensure we don't exceed waveform bounds
+                start_frame = max(0, start_frame)
+                end_frame = min(waveform.shape[1], end_frame)
+                
+                if start_frame >= end_frame:
+                    print(f"⚠️ Skipping invalid segment: {start_time:.1f}s - {end_time:.1f}s")
+                    continue
+                
                 segment_waveform = waveform[:, start_frame:end_frame]
                 
-                # Save and transcribe segment
-                temp_file = output_dir / "temp_segment.wav"
-                torchaudio.save(str(temp_file), segment_waveform, sr)
-                result = asr_model.transcribe(str(temp_file), fp16=False)
-                text = result["text"].strip()
-                
-                # Clean up temp file
-                if temp_file.exists():
-                    temp_file.unlink()
-                
-                # Store segment info
-                segment = {
-                    'start': start_time,
-                    'end': end_time,
-                    'speaker': speaker_label,
-                    'text': text,
-                    'segment_id': len(transcript_segments)
-                }
-                transcript_segments.append(segment)
-                
-                print(f"[{start_time:.1f}s - {end_time:.1f}s] {speaker_label}: {text}")
+                # Save segment to temporary file
+                temp_file = output_dir / f"temp_segment_{len(transcript_segments)}.wav"
+                try:
+                    torchaudio.save(str(temp_file), segment_waveform, sr)
+                    
+                    # Transcribe segment
+                    result = asr_model.transcribe(str(temp_file), fp16=False)
+                    text = result["text"].strip()
+                    
+                    # Clean up temp file
+                    if temp_file.exists():
+                        temp_file.unlink()
+                    
+                    # Store segment info
+                    segment = {
+                        'start': start_time,
+                        'end': end_time,
+                        'speaker': speaker_label,
+                        'text': text,
+                        'segment_id': len(transcript_segments)
+                    }
+                    transcript_segments.append(segment)
+                    
+                    print(f"[{start_time:.1f}s - {end_time:.1f}s] {speaker_label}: {text}")
+                    
+                except Exception as e:
+                    print(f"⚠️ Error processing segment {start_time:.1f}s - {end_time:.1f}s: {e}")
+                    # Clean up temp file if it exists
+                    if temp_file.exists():
+                        temp_file.unlink()
+                    continue
         
         # Save original transcript to JSON
         original_file = output_dir / "transcripts" / "01_original_transcript.json"
@@ -302,23 +411,23 @@ class AudioTranscriptionPipeline:
         
         system_prompt = """You are an expert at identifying speakers in transcripts by analyzing context clues, introductions, and conversational patterns.
 
-Your task is to:
-1. Analyze the transcript for names mentioned in the conversation
-2. Identify which speaker corresponds to which name based on context
-3. Replace generic speaker labels (like Speaker_01, Speaker_02) with actual names when possible
-4. Maintain speaker consistency throughout the transcript
-5. If you can't identify a name with high confidence, keep the original speaker label
+        Your task is to:
+        1. Analyze the transcript for names mentioned in the conversation
+        2. Identify which speaker corresponds to which name based on context
+        3. Replace generic speaker labels (like Speaker_01, Speaker_02) with actual names when possible
+        4. Maintain speaker consistency throughout the transcript
+        5. If you can't identify a name with high confidence, keep the original speaker label
 
-Return a JSON object with speaker mappings in this format:
-{
-  "speaker_mappings": {
-    "Speaker_01": "John Smith",
-    "Speaker_02": "Speaker_02"
-  },
-  "confidence_notes": "Brief explanation of how names were identified",
-  "names_found": ["John Smith"],
-  "unnamed_speakers": ["Speaker_02"]
-}"""
+        Return a JSON object with speaker mappings in this format:
+        {
+        "speaker_mappings": {
+            "Speaker_01": "John Smith",
+            "Speaker_02": "Speaker_02"
+        },
+        "confidence_notes": "Brief explanation of how names were identified",
+        "names_found": ["John Smith"],
+        "unnamed_speakers": ["Speaker_02"]
+        }"""
 
         messages = [
             SystemMessage(content=system_prompt),
@@ -400,34 +509,34 @@ Return a JSON object with speaker mappings in this format:
         
         system_prompt = """You are a transcript verification expert. Your job is to ensure that when speaker labels were updated, no content was accidentally modified.
 
-Compare the original and named transcripts and check for:
-1. Any changes to the actual spoken text content
-2. Any changes to timestamps
-3. Any missing or added segments
-4. Speaker label consistency issues
+            Compare the original and named transcripts and check for:
+            1. Any changes to the actual spoken text content
+            2. Any changes to timestamps
+            3. Any missing or added segments
+            4. Speaker label consistency issues
 
-The ONLY acceptable changes are speaker label updates (e.g., "Speaker_01" → "John Smith").
+            The ONLY acceptable changes are speaker label updates (e.g., "Speaker_01" → "John Smith").
 
-Return a JSON object with this format:
-{
-  "verification_passed": true/false,
-  "issues_found": [
-    {
-      "segment_id": 0,
-      "issue_type": "text_change",
-      "description": "Text content was modified",
-      "original_text": "...",
-      "named_text": "...",
-      "severity": "high"
-    }
-  ],
-  "summary": "Brief summary of verification results",
-  "stats": {
-    "total_segments": 0,
-    "segments_with_issues": 0,
-    "acceptable_changes": 0
-  }
-}"""
+            Return a JSON object with this format:
+            {
+            "verification_passed": true/false,
+            "issues_found": [
+                {
+                "segment_id": 0,
+                "issue_type": "text_change",
+                "description": "Text content was modified",
+                "original_text": "...",
+                "named_text": "...",
+                "severity": "high"
+                }
+            ],
+            "summary": "Brief summary of verification results",
+            "stats": {
+                "total_segments": 0,
+                "segments_with_issues": 0,
+                "acceptable_changes": 0
+            }
+            }"""
 
         messages = [
             SystemMessage(content=system_prompt),
@@ -486,13 +595,13 @@ Return a JSON object with this format:
         
         system_prompt = """You are a transcript repair expert. Given a list of issues found in a transcript, fix them by restoring the original content while preserving the correct speaker names.
 
-Rules for fixing:
-1. Restore original text content exactly as it was
-2. Restore original timestamps exactly as they were
-3. Keep the updated speaker names (the only acceptable changes)
-4. Do not make any other modifications
+            Rules for fixing:
+            1. Restore original text content exactly as it was
+            2. Restore original timestamps exactly as they were
+            3. Keep the updated speaker names (the only acceptable changes)
+            4. Do not make any other modifications
 
-Return the corrected transcript segments as a JSON array."""
+            Return the corrected transcript segments as a JSON array."""
 
         fix_context = {
             "issues": issues,
@@ -770,25 +879,31 @@ def get_audio_file_path(provided_path=None):
 def main():
     """Command line interface"""
     parser = argparse.ArgumentParser(
-        description="LangGraph Audio Transcription Pipeline",
-        epilog="""
-Environment Variables (required in .env file):
-  ANTHROPIC_API_KEY     Your Anthropic Claude API key
-  HUGGINGFACE_TOKEN     Your HuggingFace authentication token
+        description="LangGraph Audio Transcription Pipeline with Auto-Conversion",
+                epilog="""
+        Environment Variables (required in .env file):
+        ANTHROPIC_API_KEY     Your Anthropic Claude API key
+        HUGGINGFACE_TOKEN     Your HuggingFace authentication token
 
-Example .env file:
-  ANTHROPIC_API_KEY=sk-ant-api03-...
-  HUGGINGFACE_TOKEN=hf_...
+        Example .env file:
+        ANTHROPIC_API_KEY=sk-ant-api03-...
+        HUGGINGFACE_TOKEN=hf_...
 
-Example usage:
-  python transcription_pipeline.py                              # Interactive mode
-  python transcription_pipeline.py audio.mp3                   # Direct file
-  python transcription_pipeline.py /path/to/meeting.wav --whisper-model medium
-        """,
+        Dependencies:
+        - ffmpeg must be installed for audio conversion (non-WAV files)
+        - Windows: choco install ffmpeg OR winget install ffmpeg
+        - macOS: brew install ffmpeg
+        - Linux: apt install ffmpeg (Ubuntu/Debian) or yum install ffmpeg (RHEL/CentOS)
+
+        Example usage:
+        python transcription_pipeline.py                              # Interactive mode
+        python transcription_pipeline.py audio.mp3                   # Direct file (auto-converts)
+        python transcription_pipeline.py /path/to/meeting.wav --whisper-model medium
+                """,
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
     
-    parser.add_argument("audio_file", nargs='?', help="Path to the audio file (optional - will prompt if not provided)")
+    parser.add_argument("audio_file", nargs='?', help="Path to the audio file (any format - will auto-convert if needed)")
     parser.add_argument("--claude-api-key", 
                        help="Anthropic Claude API key (overrides .env file)")
     parser.add_argument("--hf-token", 
@@ -830,6 +945,52 @@ Example usage:
         print(f"🤖 Whisper model: {args.whisper_model}")
         print(f"🔄 Max retries: {args.max_retries}")
         print(f"🔑 Using API keys from: {'command line' if args.claude_api_key else '.env file'}")
+        
+        # Check if ffmpeg is available for non-WAV files
+        audio_ext = Path(audio_file_path).suffix.lower()
+        if audio_ext != '.wav':
+            try:
+                # Try to detect ffmpeg (cross-platform)
+                import platform
+                system = platform.system()
+                
+                if system == 'Windows':
+                    # Try common Windows ffmpeg commands
+                    ffmpeg_found = False
+                    for cmd in ['ffmpeg', 'ffmpeg.exe']:
+                        try:
+                            subprocess.run([cmd, '-version'], capture_output=True, check=True)
+                            ffmpeg_found = True
+                            break
+                        except (subprocess.CalledProcessError, FileNotFoundError):
+                            continue
+                    
+                    if ffmpeg_found:
+                        print(f"🔧 ffmpeg detected - will convert {audio_ext} to WAV")
+                    else:
+                        raise FileNotFoundError()
+                else:
+                    # Unix-like systems (macOS, Linux)
+                    subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
+                    print(f"🔧 ffmpeg detected - will convert {audio_ext} to WAV")
+                    
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                system = platform.system()
+                if system == 'Windows':
+                    print("⚠️ Warning: ffmpeg not found - conversion may fail for non-WAV files")
+                    print("Install ffmpeg on Windows:")
+                    print("  • Chocolatey: choco install ffmpeg")
+                    print("  • winget: winget install ffmpeg")
+                    print("  • Manual: https://ffmpeg.org/download.html#build-windows")
+                elif system == 'Darwin':  # macOS
+                    print("⚠️ Warning: ffmpeg not found - conversion may fail for non-WAV files")
+                    print("Install ffmpeg on macOS: brew install ffmpeg")
+                else:  # Linux
+                    print("⚠️ Warning: ffmpeg not found - conversion may fail for non-WAV files")
+                    print("Install ffmpeg on Linux: apt install ffmpeg (Ubuntu/Debian) or yum install ffmpeg (RHEL/CentOS)")
+        else:
+            print("✅ WAV format detected - no conversion needed")
+        
         print()
         
         # Initialize pipeline
