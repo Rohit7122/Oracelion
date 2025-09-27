@@ -1,0 +1,20 @@
+# Ignore Python virtual environments
+.venv/
+env/
+
+# Ignore environment variables
+.env
+
+# Ignore all files inside data/ and audio_file/ but not the directories themselves
+data/*
+!data/.gitkeep
+audio_file/*
+!audio_file/.gitkeep
+
+# Ignore Python cache files
+__pycache__/
+*.py[cod]
+
+# Ignore system files
+.DS_Store
+Thumbs.db
