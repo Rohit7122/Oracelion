@@ -195,45 +195,81 @@ class AudioTranscriptionPipeline:
         waveform, sr = torchaudio.load(state["audio_file_path"])
         diarization = pipeline(state["audio_file_path"])
         
-        # Process audio segments
+        # MODIFIED PART: Group consecutive segments by speaker
         speaker_map = {}
         speaker_counter = 1
         transcript_segments = []
         
+        # Convert diarization to list and sort by start time
+        diarization_list = []
         for turn, _, speaker in diarization.itertracks(yield_label=True):
-            # Map speakers
-            if speaker not in speaker_map:
-                speaker_map[speaker] = f"Speaker_{speaker_counter:02d}"
-                speaker_counter += 1
+            diarization_list.append((turn.start, turn.end, speaker))
+        
+        diarization_list.sort(key=lambda x: x[0])  # Sort by start time
+        
+        # Group consecutive segments by the same speaker with small gap tolerance
+        if diarization_list:
+            merged_segments = []
+            current_speaker = None
+            current_start = None
+            current_end = None
+            gap_tolerance = 1.0  # Allow small gaps of up to 1 second between same speaker segments
             
-            speaker_label = speaker_map[speaker]
+            for start_time, end_time, speaker in diarization_list:
+                if current_speaker is None:
+                    # First segment
+                    current_speaker = speaker
+                    current_start = start_time
+                    current_end = end_time
+                elif speaker == current_speaker and (start_time - current_end) <= gap_tolerance:
+                    # Same speaker and small gap or overlapping - extend current segment
+                    current_end = max(current_end, end_time)
+                else:
+                    # Different speaker or large gap - save current segment and start new one
+                    merged_segments.append((current_start, current_end, current_speaker))
+                    current_speaker = speaker
+                    current_start = start_time
+                    current_end = end_time
             
-            # Process audio segment
-            start_frame = int(turn.start * sr)
-            end_frame = int(turn.end * sr)
-            segment_waveform = waveform[:, start_frame:end_frame]
+            # Don't forget the last segment
+            if current_speaker is not None:
+                merged_segments.append((current_start, current_end, current_speaker))
             
-            # Save and transcribe segment
-            temp_file = output_dir / "temp_segment.wav"
-            torchaudio.save(str(temp_file), segment_waveform, sr)
-            result = asr_model.transcribe(str(temp_file), fp16=False)
-            text = result["text"].strip()
-            
-            # Clean up temp file
-            if temp_file.exists():
-                temp_file.unlink()
-            
-            # Store segment info
-            segment = {
-                'start': turn.start,
-                'end': turn.end,
-                'speaker': speaker_label,
-                'text': text,
-                'segment_id': len(transcript_segments)
-            }
-            transcript_segments.append(segment)
-            
-            print(f"[{turn.start:.1f}s - {turn.end:.1f}s] {speaker_label}: {text}")
+            # Process merged segments
+            for start_time, end_time, speaker in merged_segments:
+                # Map speakers
+                if speaker not in speaker_map:
+                    speaker_map[speaker] = f"Speaker_{speaker_counter:02d}"
+                    speaker_counter += 1
+                
+                speaker_label = speaker_map[speaker]
+                
+                # Process audio segment
+                start_frame = int(start_time * sr)
+                end_frame = int(end_time * sr)
+                segment_waveform = waveform[:, start_frame:end_frame]
+                
+                # Save and transcribe segment
+                temp_file = output_dir / "temp_segment.wav"
+                torchaudio.save(str(temp_file), segment_waveform, sr)
+                result = asr_model.transcribe(str(temp_file), fp16=False)
+                text = result["text"].strip()
+                
+                # Clean up temp file
+                if temp_file.exists():
+                    temp_file.unlink()
+                
+                # Store segment info
+                segment = {
+                    'start': start_time,
+                    'end': end_time,
+                    'speaker': speaker_label,
+                    'text': text,
+                    'segment_id': len(transcript_segments)
+                }
+                transcript_segments.append(segment)
+                
+                print(f"[{start_time:.1f}s - {end_time:.1f}s] {speaker_label}: {text}")
         
         # Save original transcript to JSON
         original_file = output_dir / "transcripts" / "01_original_transcript.json"
@@ -250,7 +286,7 @@ class AudioTranscriptionPipeline:
         self._log_step(state["output_dir"], "transcribe_audio", transcript_segments)
         
         return state
-    
+        
     def _name_speakers(self, state: TranscriptionState) -> TranscriptionState:
         """Step 2: Use LLM to identify and name speakers from context"""
         print("🤖 Identifying speaker names from context...")
